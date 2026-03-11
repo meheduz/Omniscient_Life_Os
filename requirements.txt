@@ -1,0 +1,24 @@
+# Omniscient Context-Aware Agent - Gemini Live Agent Challenge
+# Python 3.10+
+
+# Gemini Live API
+google-genai>=1.0.0
+
+# Bidirectional streaming
+websockets>=12.0
+
+# Audio I/O (optional on Windows: see README for pre-built wheel)
+# pyaudio>=0.2.14
+
+# Vision capture
+opencv-python>=4.9.0
+mss>=9.0.0
+
+# Local vector database
+chromadb>=0.4.24
+sentence-transformers>=2.2.0
+
+# Utilities
+numpy>=1.26.0
+Pillow>=10.0.0
+python-dotenv>=1.0.0
