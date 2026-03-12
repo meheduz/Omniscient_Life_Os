@@ -6,33 +6,30 @@ Tool implementations for Gemini Live API.
 from __future__ import annotations
 
 import subprocess
-import re
+import shlex
+from pathlib import Path
 from typing import Any
 
+from config import ALLOWED_EXECUTABLES as CONFIG_ALLOWED_EXECUTABLES, COMMAND_TIMEOUT
 from memory import save_memory as _save_memory, search_memory as _search_memory
 
 
-# Allowed command patterns for safe terminal execution
-ALLOWED_PATTERNS = [
-    r"^\s*cd\s+",           # cd /path
-    r"^\s*python\s+",        # python script.py
-    r"^\s*python3\s+",       # python3 script.py
-    r"^\s*g\+\+\s+",         # g++ file.cpp
-    r"^\s*\./a\.out",        # ./a.out
-    r"^\s*\./a\.out\s",      # ./a.out with args
-]
+# Allowed command executables for safe terminal execution
+ALLOWED_EXECUTABLES = set(CONFIG_ALLOWED_EXECUTABLES)
+_CURRENT_WORKDIR = Path.cwd()
 
 
 def _is_command_allowed(command: str) -> bool:
-    """Check if command matches allowed patterns (cd, python, g++, ./a.out)."""
-    cmd_stripped = command.strip()
-    if not cmd_stripped:
+    """Check if command is allowed (cd, python/python3, g++, ./a.out)."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
         return False
-    for pattern in ALLOWED_PATTERNS:
-        if re.match(pattern, cmd_stripped, re.IGNORECASE):
-            return True
-    # Exact match for ./a.out
-    if cmd_stripped == "./a.out":
+    if not parts:
+        return False
+    if parts[0] == "cd":
+        return len(parts) >= 2
+    if parts[0] in ALLOWED_EXECUTABLES:
         return True
     return False
 
@@ -51,13 +48,37 @@ def execute_terminal(command: str) -> dict[str, Any]:
         }
 
     try:
+        parts = shlex.split(command)
+    except ValueError as e:
+        return {"stdout": "", "stderr": f"Invalid command syntax: {e}", "returncode": -1}
+
+    if not parts:
+        return {"stdout": "", "stderr": "Empty command.", "returncode": -1}
+
+    global _CURRENT_WORKDIR
+    if parts[0] == "cd":
+        target_str = parts[1]
+        target = Path(target_str).expanduser()
+        if not target.is_absolute():
+            target = (_CURRENT_WORKDIR / target).resolve()
+        if not target.exists():
+            return {"stdout": "", "stderr": f"Directory not found: {target}", "returncode": -1}
+        if not target.is_dir():
+            return {"stdout": "", "stderr": f"Not a directory: {target}", "returncode": -1}
+        _CURRENT_WORKDIR = target
+        return {
+            "stdout": f"Changed directory to: {_CURRENT_WORKDIR}",
+            "stderr": "",
+            "returncode": 0,
+        }
+
+    try:
         result = subprocess.run(
-            command,
-            shell=True,
+            parts,
             capture_output=True,
             text=True,
-            timeout=60,
-            cwd=None,  # Uses current working directory
+            timeout=COMMAND_TIMEOUT,
+            cwd=str(_CURRENT_WORKDIR),
         )
         return {
             "stdout": result.stdout or "",
@@ -67,7 +88,7 @@ def execute_terminal(command: str) -> dict[str, Any]:
     except subprocess.TimeoutExpired:
         return {
             "stdout": "",
-            "stderr": "Command timed out after 60 seconds.",
+            "stderr": f"Command timed out after {COMMAND_TIMEOUT} seconds.",
             "returncode": -1,
         }
     except Exception as e:

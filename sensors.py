@@ -18,41 +18,52 @@ import cv2
 import mss
 import numpy as np
 
+from config import (
+    AUDIO_CHANNELS,
+    AUDIO_CHUNK_SIZE,
+    AUDIO_SAMPLE_RATE,
+    ENABLE_SCREEN_CAPTURE,
+    ENABLE_WEBCAM,
+    JPEG_QUALITY,
+    SCREEN_HEIGHT,
+    SCREEN_WIDTH,
+    VISION_INTERVAL,
+    WEBCAM_HEIGHT,
+    WEBCAM_WIDTH,
+)
+
 # Audio config for Gemini Live (16-bit PCM, 16kHz, mono)
-SAMPLE_RATE = 16000
-CHANNELS = 1
-CHUNK_SIZE = 1024
+SAMPLE_RATE = AUDIO_SAMPLE_RATE
+CHANNELS = AUDIO_CHANNELS
+CHUNK_SIZE = AUDIO_CHUNK_SIZE
 if pyaudio is not None:
     FORMAT = pyaudio.paInt16
 else:
     FORMAT = None
 
-# Vision capture interval (seconds)
-VISION_INTERVAL = 5
-
-# Resize dimensions for stitched frame (reduce bandwidth)
-WEBCAM_WIDTH = 320
-WEBCAM_HEIGHT = 240
-SCREEN_WIDTH = 640
-SCREEN_HEIGHT = 360
-
-
 def _capture_webcam() -> np.ndarray | None:
     """Capture a single frame from the default webcam."""
+    if not ENABLE_WEBCAM:
+        return None
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         return None
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, WEBCAM_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, WEBCAM_HEIGHT)
     ret, frame = cap.read()
     cap.release()
     if not ret or frame is None:
         return None
-    frame = cv2.resize(frame, (WEBCAM_WIDTH, WEBCAM_HEIGHT))
+    if frame.shape[:2] != (WEBCAM_HEIGHT, WEBCAM_WIDTH):
+        frame = cv2.resize(frame, (WEBCAM_WIDTH, WEBCAM_HEIGHT))
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return frame
 
 
 def _capture_screen() -> np.ndarray | None:
     """Capture the primary monitor screen."""
+    if not ENABLE_SCREEN_CAPTURE:
+        return None
     with mss.mss() as sct:
         monitor = sct.monitors[0]
         screenshot = sct.grab(monitor)
@@ -78,7 +89,7 @@ def capture_stitched_frame() -> str | None:
         screen = np.zeros((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
 
     # Resize both to the same height before stitching
-    target_h = WEBCAM_HEIGHT  # 240
+    target_h = WEBCAM_HEIGHT
     if webcam.shape[0] != target_h:
         scale = target_h / webcam.shape[0]
         webcam = cv2.resize(webcam, (int(webcam.shape[1] * scale), target_h))
@@ -88,7 +99,12 @@ def capture_stitched_frame() -> str | None:
 
     # Stitch side-by-side: [webcam | screen]
     stitched = np.hstack([webcam, screen])
-    _, buf = cv2.imencode(".jpg", cv2.cvtColor(stitched, cv2.COLOR_RGB2BGR))
+    # Use lower JPEG quality for smaller payload
+    _, buf = cv2.imencode(
+        ".jpg",
+        cv2.cvtColor(stitched, cv2.COLOR_RGB2BGR),
+        [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
+    )
     return base64.b64encode(buf.tobytes()).decode("utf-8")
 
 
@@ -113,7 +129,7 @@ async def stream_microphone_audio(
         frames_per_buffer=CHUNK_SIZE,
     )
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _read_chunk() -> bytes:
         return stream.read(CHUNK_SIZE, exception_on_overflow=False)

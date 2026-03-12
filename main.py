@@ -7,18 +7,38 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import os
 import sys
 from typing import Any
 
+import io
 from dotenv import load_dotenv
 load_dotenv()
 
-# Force UTF-8 output on Windows terminals to avoid cp1252 encoding errors
-import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+from config import (
+    AUDIO_SAMPLE_RATE,
+    BATCH_DELAY,
+    ENABLE_MICROPHONE,
+    ENABLE_SCREEN_CAPTURE,
+    ENABLE_WEBCAM,
+    LIVE_MODEL,
+    OUTPUT_CHANNELS,
+    OUTPUT_CHUNK_SIZE,
+    OUTPUT_SAMPLE_RATE,
+)
 
+
+def _force_utf8_streams() -> None:
+    """Force UTF-8 output streams where supported (mostly for Windows terminals)."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and hasattr(stream, "buffer"):
+            wrapped = io.TextIOWrapper(stream.buffer, encoding="utf-8", errors="replace")
+            setattr(sys, stream_name, wrapped)
+
+
+_force_utf8_streams()
 print("Starting Omniscient Life OS Agent...", flush=True)
 
 
@@ -34,18 +54,6 @@ from memory import init_memory
 from sensors import stream_microphone_audio, vision_loop
 from tools import execute_terminal, save_memory, search_memory, get_gemini_tools
 
-
-# Gemini Live model (native audio for voice)
-# Available native audio models:
-# - models/gemini-2.5-flash-native-audio-latest (always latest)
-# - models/gemini-2.5-flash-native-audio-preview-12-2025 (December 2025)
-# - models/gemini-2.5-flash-native-audio-preview-09-2025 (September 2025)
-LIVE_MODEL = "models/gemini-2.5-flash-native-audio-latest"
-
-# Audio output: 24kHz PCM from Gemini
-OUTPUT_SAMPLE_RATE = 24000
-OUTPUT_CHANNELS = 1
-OUTPUT_CHUNK = 1024
 if pyaudio is not None:
     OUTPUT_FORMAT = pyaudio.paInt16
 else:
@@ -64,12 +72,12 @@ Be proactive:
 Do NOT wait for me to ask you to use a tool. If a terminal action or memory retrieval is logically required, execute it autonomously. You have full permission to call execute_terminal, save_memory, and search_memory whenever it makes sense."""
 
 
-def _play_audio_chunk(pyaudio_instance: pyaudio.PyAudio, stream, data: bytes) -> None:
+def _play_audio_chunk(stream, data: bytes) -> None:
     """Play a chunk of PCM audio to the default output device."""
     if not data:
         return
     try:
-        stream.write(data)
+        stream.write(data, exception_on_underflow=False)
     except Exception:
         pass
 
@@ -148,88 +156,118 @@ async def run_agent() -> None:
         channels=OUTPUT_CHANNELS,
         rate=OUTPUT_SAMPLE_RATE,
         output=True,
-        frames_per_buffer=OUTPUT_CHUNK,
+        frames_per_buffer=OUTPUT_CHUNK_SIZE,
     )
 
-    async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
-        print("[OK] Connected to Gemini Live!", flush=True)
-        print("Starting microphone, webcam, and screen capture...", flush=True)
-        print("Agent is now listening and watching. Speak OR type a message and press Enter.\n", flush=True)
+    tasks: list[asyncio.Task[Any]] = []
+    try:
+        async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
+            print("[OK] Connected to Gemini Live!", flush=True)
+            print("Starting microphone, webcam, and screen capture...", flush=True)
+            print("Agent is now listening and watching. Speak OR type a message and press Enter.\n", flush=True)
 
-        send_queue: asyncio.Queue[dict] = asyncio.Queue()
+            send_queue: asyncio.Queue[dict] = asyncio.Queue()
 
-        async def _mic_sender():
-            async def send_chunk(data: bytes):
-                await send_queue.put({"type": "audio", "data": data})
-            await stream_microphone_audio(send_chunk)
+            async def _mic_sender():
+                async def send_chunk(data: bytes):
+                    await send_queue.put({"type": "audio", "data": data})
+                await stream_microphone_audio(send_chunk)
 
-        async def _vision_sender():
-            async def send_frame(b64: str):
-                await send_queue.put({"type": "video", "data": b64})
-            await vision_loop(send_frame)
+            async def _vision_sender():
+                async def send_frame(b64: str):
+                    await send_queue.put({"type": "video", "data": b64})
+                await vision_loop(send_frame)
 
-        async def _pump_send():
-            while True:
-                msg = await send_queue.get()
-                if msg["type"] == "audio":
-                    await session.send_realtime_input(
-                        audio=types.Blob(
-                            data=msg["data"],
-                            mime_type="audio/pcm;rate=16000",
-                        ),
-                    )
-                elif msg["type"] == "video":
-                    img_bytes = base64.b64decode(msg["data"])
-                    await session.send_realtime_input(
-                        video=types.Blob(
-                            data=img_bytes,
-                            mime_type="image/jpeg",
-                        ),
-                    )
+            async def _pump_send():
+                """Batch and send queued messages to reduce API calls."""
+                while True:
+                    msg = await send_queue.get()
+                    if msg["type"] == "audio":
+                        await session.send_realtime_input(
+                            audio=types.Blob(
+                                data=msg["data"],
+                                mime_type=f"audio/pcm;rate={AUDIO_SAMPLE_RATE}",
+                            ),
+                        )
+                    elif msg["type"] == "video":
+                        img_bytes = base64.b64decode(msg["data"])
+                        await session.send_realtime_input(
+                            video=types.Blob(
+                                data=img_bytes,
+                                mime_type="image/jpeg",
+                            ),
+                        )
+                    await asyncio.sleep(BATCH_DELAY)
 
-        async def _text_input_sender():
-            """Read text from stdin in a thread and send to session."""
-            loop = asyncio.get_event_loop()
-            while True:
-                text = await loop.run_in_executor(None, sys.stdin.readline)
-                text = text.strip()
-                if text:
-                    print(f"[You]: {text}", flush=True)
-                    await session.send_realtime_input(text=text)
+            async def _text_input_sender():
+                """Read text from stdin in a thread and send to session."""
+                loop = asyncio.get_running_loop()
+                while True:
+                    text = await loop.run_in_executor(None, sys.stdin.readline)
+                    text = text.strip()
+                    if text:
+                        print(f"[You]: {text}", flush=True)
+                        try:
+                            await session.send_client_content(
+                                turns=types.Content(
+                                    role="user",
+                                    parts=[types.Part.from_text(text=text)],
+                                ),
+                                turn_complete=True,
+                            )
+                        except Exception as e:
+                            print(f"[Error sending text]: {e}", flush=True)
+                            # Fallback: try as realtime input
+                            try:
+                                await session.send_realtime_input(text=text)
+                            except Exception as e2:
+                                print(f"[Error with fallback]: {e2}", flush=True)
 
-        async def _receive_loop():
-            async for event in session.receive():
-                # Handle tool calls (top-level event)
-                if hasattr(event, "tool_call") and event.tool_call:
-                    for fc in event.tool_call.function_calls or []:
-                        await _handle_tool_call(session, fc, memory_collection)
+            async def _receive_loop():
+                """Receive and process events from Gemini Live."""
+                async for event in session.receive():
+                    if hasattr(event, "tool_call") and event.tool_call:
+                        for fc in event.tool_call.function_calls or []:
+                            asyncio.create_task(_handle_tool_call(session, fc, memory_collection))
 
-                # Handle audio/text from the model
-                if hasattr(event, "server_content") and event.server_content:
-                    sc = event.server_content
-                    model_turn = getattr(sc, "model_turn", None)
-                    parts = getattr(model_turn, "parts", None) or []
-                    for part in parts:
-                        if hasattr(part, "inline_data") and part.inline_data:
-                            blob = part.inline_data
-                            if blob and blob.data:
-                                print(f"[Audio] Playing {len(blob.data)} bytes", flush=True)
-                                _play_audio_chunk(pa, out_stream, blob.data)
-                        if hasattr(part, "text") and part.text:
-                            print(f"[Agent]: {part.text}", flush=True)
+                    if hasattr(event, "server_content") and event.server_content:
+                        sc = event.server_content
+                        model_turn = getattr(sc, "model_turn", None)
+                        parts = getattr(model_turn, "parts", None) or []
+                        for part in parts:
+                            if hasattr(part, "inline_data") and part.inline_data:
+                                blob = part.inline_data
+                                if blob and blob.data:
+                                    _play_audio_chunk(out_stream, blob.data)
+                            if hasattr(part, "text") and part.text:
+                                print(f"[Agent]: {part.text}", flush=True)
 
-        # Run mic, vision, pump, text input, and receive concurrently
-        mic_task = asyncio.create_task(_mic_sender())
-        vision_task = asyncio.create_task(_vision_sender())
-        pump_task = asyncio.create_task(_pump_send())
-        text_task = asyncio.create_task(_text_input_sender())
-        recv_task = asyncio.create_task(_receive_loop())
+            tasks = [
+                asyncio.create_task(_pump_send()),
+                asyncio.create_task(_text_input_sender()),
+                asyncio.create_task(_receive_loop()),
+            ]
+            if ENABLE_MICROPHONE:
+                tasks.append(asyncio.create_task(_mic_sender()))
+            else:
+                print("[Config] Microphone stream disabled.", flush=True)
 
-        await asyncio.gather(mic_task, vision_task, pump_task, text_task, recv_task)
-
-    out_stream.stop_stream()
-    out_stream.close()
-    pa.terminate()
+            if ENABLE_WEBCAM or ENABLE_SCREEN_CAPTURE:
+                tasks.append(asyncio.create_task(_vision_sender()))
+            else:
+                print("[Config] Vision stream disabled.", flush=True)
+            await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            out_stream.stop_stream()
+        with contextlib.suppress(Exception):
+            out_stream.close()
+        with contextlib.suppress(Exception):
+            pa.terminate()
 
 
 def main() -> None:

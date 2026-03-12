@@ -7,7 +7,7 @@ load_dotenv()
 try:
     from google import genai
     
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         print("❌ No API key found!")
         exit(1)
@@ -34,7 +34,7 @@ try:
     print("\n\nTesting basic text generation...")
     try:
         response = client.models.generate_content(
-            model="gemini-2.0-flash-exp",
+            model="models/gemini-2.5-flash",
             contents="Say 'Hello' if you can hear me."
         )
         print(f"✅ Basic generation works: {response.text[:100]}")
